@@ -34,6 +34,7 @@ import { ROLE_RANK, type ActiveOrg, type AuthUser, type Role } from "@/lib/auth/
 import { traduzir } from "@/lib/i18n/dicionario";
 import { STATUS_OPERANTE, ehOperante } from "@/lib/organizacao/operante";
 import { createClient } from "@/lib/supabase/server";
+import { obterOuComputar } from "@/lib/cache/camada-cache";
 
 export type RoleCheck =
   | { ok: true; user: AuthUser; org: ActiveOrg }
@@ -244,11 +245,23 @@ export async function requireRole(min: Role, opts: RequireRoleOpts = {}): Promis
     (required) => ({ required }),
     (error: unknown) => ({ error }),
   );
-  const { data: effectiveRole, error } = await supabase.rpc("fn_user_role_in_org", {
-    p_org: org.orgId,
-  });
-  if (error) {
-    return { ok: false, response: fail("internal_error", error.message, 500, { requestId }) };
+  let effectiveRole: string | null = null;
+  try {
+    effectiveRole = await obterOuComputar(`role:${user.id}:${org.orgId}`, 20, async () => {
+      const { data, error } = await supabase.rpc("fn_user_role_in_org", {
+        p_org: org.orgId,
+      });
+      if (error) throw error;
+      return (data as string) ?? null;
+    });
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error
+        ? err.message
+        : err && typeof err === "object" && "message" in err
+          ? String((err as { message: unknown }).message)
+          : String(err);
+    return { ok: false, response: fail("internal_error", message, 500, { requestId }) };
   }
 
   const rank = effectiveRole ? (ROLE_RANK[effectiveRole as Role] ?? 0) : 0;

@@ -23,6 +23,7 @@ import {
 } from "@/lib/auth/politica-mfa";
 import { normalizarIdioma } from "@/lib/i18n/idiomas";
 import { STATUS_OPERANTE, ehOperante } from "@/lib/organizacao/operante";
+import { hashSessao, obterOuComputar } from "@/lib/cache/camada-cache";
 import type { AuthUser, Role, UserOrgMembership, ActiveOrg } from "./types";
 
 const ACTIVE_ORG_COOKIE = "active_org";
@@ -135,165 +136,188 @@ export function ehSessaoAusente(error: { name?: string } | null | undefined): bo
 }
 
 export const loadAuthUser = cache(async (): Promise<AuthUser | null> => {
-  const supabase = await createClient();
-  const {
-    data: { user },
-    error,
-  } = await supabase.auth.getUser();
-  // ⚠️ O `error` era DESCARTADO — nem chegava a ser desestruturado —, e aqui
-  // `user: null` é tão ambíguo quanto o `data: null` que a query logo abaixo
-  // trata com todo o cuidado: significa "não está logado" (estado normal) E
-  // "não deu para perguntar" (rede, GoTrue fora do ar, token ilegível).
-  //
-  // A ação não muda, e isso é deliberado: sem usuário confirmado, devolver
-  // `null` — e portanto redirecionar para o login — é o desfecho seguro.
-  // Falhar FECHADO na ação continua certo. O que estava errado era falhar
-  // fechado também na INFORMAÇÃO: quem investigasse depois via só uma pessoa
-  // "deslogada", sem nada distinguindo isso de uma falha transitória.
-  //
-  // Custou caro uma vez: um vermelho de e2e em que a barra lateral "perdeu o
-  // logo" foi, por eliminação, uma casca de app que não era a casca do app —
-  // e a hipótese nº 1 é justamente um redirect nascido aqui. Com este log, a
-  // próxima ocorrência se explica sozinha em vez de custar uma investigação.
-  //
-  // ⚠️ MAS NEM TODO `error` AQUI É INCIDENTE — e é por isso que `ehSessaoAusente`
-  // existe. Ver o comentário dela: sem esse filtro, este log dispara em todo
-  // visitante deslogado e refaz, do lado do log, a mesma fusão que este bloco
-  // existe para desfazer.
-  if (error && !ehSessaoAusente(error)) {
-    // As chaves são as MESMAS do outro `logger.error` desta função (linha ~134):
-    // `code` e `message`. Dois nomes para o mesmo conceito, dentro da mesma
-    // função, obrigariam quem consulta o agregador a escrever duas buscas — num
-    // conserto cujo objeto é diagnóstico.
+  let cacheKey: string | null = null;
+  try {
+    const store = await cookies();
+    const authCookies = store.getAll().filter((c) => c.name.startsWith("sb-") && c.name.includes("-auth"));
+    if (authCookies.length > 0) {
+      const tokenCombined = authCookies
+        .map((c) => `${c.name}:${c.value}`)
+        .sort()
+        .join("|");
+      cacheKey = `auth_user:sess:${hashSessao(tokenCombined)}`;
+    }
+  } catch {
+    // Fora de contexto de requisição (ex.: alguns testes unitários)
+  }
+
+  const resolverUsuario = async (): Promise<AuthUser | null> => {
+    const supabase = await createClient();
+    const {
+      data: { user },
+      error,
+    } = await supabase.auth.getUser();
+    // ⚠️ O `error` era DESCARTADO — nem chegava a ser desestruturado —, e aqui
+    // `user: null` é tão ambíguo quanto o `data: null` que a query logo abaixo
+    // trata com todo o cuidado: significa "não está logado" (estado normal) E
+    // "não deu para perguntar" (rede, GoTrue fora do ar, token ilegível).
     //
-    // `name` viaja junto porque é o que separa as CLASSES: `AuthRetryableFetchError`
-    // (rede, GoTrue fora do ar) de `AuthApiError` (token ilegível). Ambas podem
-    // chegar com o mesmo `status`, e a mensagem vem em inglês do upstream — sem o
-    // nome, distinguir as duas viraria regex sobre texto que muda entre versões.
-    logger.error("[auth] getUser falhou — tratando como não autenticado", {
-      name: error.name,
-      code: error.code ?? null,
-      status: error.status ?? null,
-      message: error.message,
-    });
-  }
-  if (!user) return null;
+    // A ação não muda, e isso é deliberado: sem usuário confirmado, devolver
+    // `null` — e portanto redirecionar para o login — é o desfecho seguro.
+    // Falhar FECHADO na ação continua certo. O que estava errado era falhar
+    // fechado também na INFORMAÇÃO: quem investigasse depois via só uma pessoa
+    // "deslogada", sem nada distinguindo isso de uma falha transitória.
+    //
+    // Custou caro uma vez: um vermelho de e2e em que a barra lateral "perdeu o
+    // logo" foi, por eliminação, uma casca de app que não era a casca do app —
+    // e a hipótese nº 1 é justamente um redirect nascido aqui. Com este log, a
+    // próxima ocorrência se explica sozinha em vez de custar uma investigação.
+    //
+    // ⚠️ MAS NEM TODO `error` AQUI É INCIDENTE — e é por isso que `ehSessaoAusente`
+    // existe. Ver o comentário dela: sem esse filtro, este log dispara em todo
+    // visitante deslogado e refaz, do lado do log, a mesma fusão que este bloco
+    // existe para desfazer.
+    if (error && !ehSessaoAusente(error)) {
+      // As chaves são as MESMAS do outro `logger.error` desta função (linha ~134):
+      // `code` e `message`. Dois nomes para o mesmo conceito, dentro da mesma
+      // função, obrigariam quem consulta o agregador a escrever duas buscas — num
+      // conserto cujo objeto é diagnóstico.
+      //
+      // `name` viaja junto porque é o que separa as CLASSES: `AuthRetryableFetchError`
+      // (rede, GoTrue fora do ar) de `AuthApiError` (token ilegível). Ambas podem
+      // chegar com o mesmo `status`, e a mensagem vem em inglês do upstream — sem o
+      // nome, distinguir as duas viraria regex sobre texto que muda entre versões.
+      logger.error("[auth] getUser falhou — tratando como não autenticado", {
+        name: error.name,
+        code: error.code ?? null,
+        status: error.status ?? null,
+        message: error.message,
+      });
+    }
+    if (!user) return null;
 
-  // Platform admin e Org memberships consultados em paralelo no Supabase:
-  // elimina round-trip sequencial a cada requisição.
-  // ⚠️ `ORDER BY` NÃO É ENFEITE AQUI: esta lista decide QUAL ORGANIZAÇÃO FICA
-  // ATIVA para quem não tem o cookie `active_org` — `resolveActiveOrg` pega
-  // `organizations[0]`. Sem ordenação, "a primeira" é o que o Postgres devolver.
-  const [{ data: paRow, error: paErro }, { data: rawMemberships, error: membErro }] =
-    await Promise.all([
-      supabase
-        .from("platform_admins")
-        .select("user_id, scope, revoked_at")
-        .eq("user_id", user.id)
-        .is("revoked_at", null)
-        .maybeSingle(),
-      supabase
-        .from("user_organizations")
-        .select(
-          // Dois embeds do MESMO `organizations`, como manda o PostgREST quando a
-          // mesma relação aparece duas vezes: `organizations(...)` continua sendo
-          // o que a membership sempre trouxe (nome, IDIOMA e FUSO da empresa — o
-          // idioma decide a tela inteira e não pode depender de um embed que a
-          // issue #1341 acabou de engordar), e o alias traz só as portas da EMPRESA.
-          // `timezone` veio do main (fuso da organização nas listas, #1290) e convive
-          // com o alias: um embed por relação, sem renomear o que já existia.
-          "organization_id, role, interface_settings, accepted_at, organizations(display_name, locale, timezone, currency, country, status, suspended_kind), interface_da_empresa:organizations(interface_settings)",
-        )
-        .eq("user_id", user.id)
-        .is("revoked_at", null)
-        .order("accepted_at", { ascending: true, nullsFirst: true })
-        .order("organization_id", { ascending: true }),
-    ]);
+    // Platform admin e Org memberships consultados em paralelo no Supabase:
+    // elimina round-trip sequencial a cada requisição.
+    // ⚠️ `ORDER BY` NÃO É ENFEITE AQUI: esta lista decide QUAL ORGANIZAÇÃO FICA
+    // ATIVA para quem não tem o cookie `active_org` — `resolveActiveOrg` pega
+    // `organizations[0]`. Sem ordenação, "a primeira" é o que o Postgres devolver.
+    const [{ data: paRow, error: paErro }, { data: rawMemberships, error: membErro }] =
+      await Promise.all([
+        supabase
+          .from("platform_admins")
+          .select("user_id, scope, revoked_at")
+          .eq("user_id", user.id)
+          .is("revoked_at", null)
+          .maybeSingle(),
+        supabase
+          .from("user_organizations")
+          .select(
+            // Dois embeds do MESMO `organizations`, como manda o PostgREST quando a
+            // mesma relação aparece duas vezes: `organizations(...)` continua sendo
+            // o que a membership sempre trouxe (nome, IDIOMA e FUSO da empresa — o
+            // idioma decide a tela inteira e não pode depender de um embed que a
+            // issue #1341 acabou de engordar), e o alias traz só as portas da EMPRESA.
+            // `timezone` veio do main (fuso da organização nas listas, #1290) e convive
+            // com o alias: um embed por relação, sem renomear o que já existia.
+            "organization_id, role, interface_settings, accepted_at, organizations(display_name, locale, timezone, currency, country, status, suspended_kind), interface_da_empresa:organizations(interface_settings)",
+          )
+          .eq("user_id", user.id)
+          .is("revoked_at", null)
+          .order("accepted_at", { ascending: true, nullsFirst: true })
+          .order("organization_id", { ascending: true }),
+      ]);
 
-  /**
-   * FALHA ALTO, não baixo.
-   *
-   * Antes, o erro destas duas queries era descartado e `rawMemberships` nulo virava
-   * `[]` — ou seja, "usuário sem organização". O resultado é que uma instabilidade do
-   * banco chega ao operador como **"você não pertence a nenhuma organização"**: as
-   * telas de admin somem, as rotas devolvem 403, e nada indica que a causa é
-   * infraestrutura.
-   *
-   * Medido em 2026-07-30: com o PostgREST devolvendo `name resolution failed` depois
-   * de um restart do Docker, TODOS os cards de admin sumiram do hub de configurações.
-   * Custou seis diagnósticos errados — build velho, processo velho, cache, filtro de
-   * papel — antes de alguém olhar a causa real.
-   *
-   * Degradar permissão em silêncio é o pior desfecho possível num caminho de auth:
-   * parece uma decisão de autorização e é um defeito de infra. Melhor estourar e
-   * mostrar erro do que renderizar uma UI mentirosa.
-   */
-  if (paErro || membErro) {
-    const detalhe = (paErro ?? membErro)!;
-    logger.error("[auth] não foi possível resolver permissões do usuário", {
-      user_id: user.id,
-      onde: paErro ? "platform_admins" : "user_organizations",
-      code: detalhe.code,
-      message: detalhe.message,
+    /**
+     * FALHA ALTO, não baixo.
+     *
+     * Antes, o erro destas duas queries era descartado e `rawMemberships` nulo virava
+     * `[]` — ou seja, "usuário sem organização". O resultado é que uma instabilidade do
+     * banco chega ao operador como **"você não pertence a nenhuma organização"**: as
+     * telas de admin somem, as rotas devolvem 403, e nada indica que a causa é
+     * infraestrutura.
+     *
+     * Medido em 2026-07-30: com o PostgREST devolvendo `name resolution failed` depois
+     * de um restart do Docker, TODOS os cards de admin sumiram do hub de configurações.
+     * Custou seis diagnósticos errados — build velho, processo velho, cache, filtro de
+     * papel — antes de alguém olhar a causa real.
+     *
+     * Degradar permissão em silêncio é o pior desfecho possível num caminho de auth:
+     * parece uma decisão de autorização e é um defeito de infra. Melhor estourar e
+     * mostrar erro do que renderizar uma UI mentirosa.
+     */
+    if (paErro || membErro) {
+      const detalhe = (paErro ?? membErro)!;
+      logger.error("[auth] não foi possível resolver permissões do usuário", {
+        user_id: user.id,
+        onde: paErro ? "platform_admins" : "user_organizations",
+        code: detalhe.code,
+        message: detalhe.message,
+      });
+      throw new Error(
+        `auth_permissions_unavailable: ${detalhe.message} — permissões não puderam ser ` +
+          `resolvidas; a sessão NÃO foi rebaixada por decisão de autorização.`,
+      );
+    }
+
+    const rows = (rawMemberships ?? []) as RawMembershipRow[];
+    const memberships: UserOrgMembership[] = rows.map((row) => {
+      const orgs = row.organizations;
+      const org = Array.isArray(orgs) ? (orgs[0] ?? null) : orgs;
+      const empresas = row.interface_da_empresa;
+      const empresa = Array.isArray(empresas) ? (empresas[0] ?? null) : empresas;
+      return {
+        organization_id: row.organization_id,
+        organization_name: org?.display_name ?? "—",
+        role: row.role as Role,
+        // EMPRESA ∩ VÍNCULO (migration 0367): a empresa escolhe o universo de
+        // portas da instalação, o vínculo escolhe menos dentro dele. Até aqui o
+        // vínculo decidia sozinho, então a escolha da empresa não existia.
+        interface_settings: combinarInterfaces(empresa?.interface_settings, row.interface_settings),
+        locale: org?.locale ?? null,
+        timezone: org?.timezone ?? null,
+        currency: org?.currency ?? null,
+        country: org?.country ?? null,
+        org_status: org?.status ?? null,
+        suspended_kind: org?.suspended_kind ?? null,
+      };
     });
-    throw new Error(
-      `auth_permissions_unavailable: ${detalhe.message} — permissões não puderam ser ` +
-        `resolvidas; a sessão NÃO foi rebaixada por decisão de autorização.`,
+
+    const support = await readSupportContext(supabase);
+    const fullName = (user.user_metadata?.full_name as string | undefined) ?? null;
+    const avatarUrl = (user.user_metadata?.avatar_url as string | undefined) ?? null;
+    const locale = (user.user_metadata?.locale as string | undefined) ?? null;
+    // A cadeia inteira num lugar só: pessoa → organização ativa → padrão. Quem
+    // consome pede `idioma` e não precisa saber que existe uma ordem.
+    //
+    // O cookie só é lido quando a resposta DEPENDE dele: quem já tem preferência
+    // própria, e quem não pertence a organização nenhuma, não têm o que resolver.
+    // Ler assim mesmo faria toda tela do produto tocar o cookie para descartar o
+    // valor em seguida.
+    const idioma = normalizarIdioma(
+      locale ?? support?.locale ?? (await localeDaOrgAtiva(memberships)),
     );
+    const timezone = (user.user_metadata?.timezone as string | undefined) ?? null;
+
+    return {
+      id: user.id,
+      email: user.email ?? "",
+      full_name: fullName,
+      avatar_url: avatarUrl,
+      is_platform_admin: !!paRow,
+      platform_admin_scope: paRow?.scope ?? null,
+      locale,
+      idioma,
+      timezone,
+      organizations: memberships,
+      support,
+    };
+  };
+
+  if (cacheKey) {
+    return await obterOuComputar(cacheKey, 30, resolverUsuario);
   }
 
-  const rows = (rawMemberships ?? []) as RawMembershipRow[];
-  const memberships: UserOrgMembership[] = rows.map((row) => {
-    const orgs = row.organizations;
-    const org = Array.isArray(orgs) ? (orgs[0] ?? null) : orgs;
-    const empresas = row.interface_da_empresa;
-    const empresa = Array.isArray(empresas) ? (empresas[0] ?? null) : empresas;
-    return {
-      organization_id: row.organization_id,
-      organization_name: org?.display_name ?? "—",
-      role: row.role as Role,
-      // EMPRESA ∩ VÍNCULO (migration 0367): a empresa escolhe o universo de
-      // portas da instalação, o vínculo escolhe menos dentro dele. Até aqui o
-      // vínculo decidia sozinho, então a escolha da empresa não existia.
-      interface_settings: combinarInterfaces(empresa?.interface_settings, row.interface_settings),
-      locale: org?.locale ?? null,
-      timezone: org?.timezone ?? null,
-      currency: org?.currency ?? null,
-      country: org?.country ?? null,
-      org_status: org?.status ?? null,
-      suspended_kind: org?.suspended_kind ?? null,
-    };
-  });
-
-  const support = await readSupportContext(supabase);
-  const fullName = (user.user_metadata?.full_name as string | undefined) ?? null;
-  const avatarUrl = (user.user_metadata?.avatar_url as string | undefined) ?? null;
-  const locale = (user.user_metadata?.locale as string | undefined) ?? null;
-  // A cadeia inteira num lugar só: pessoa → organização ativa → padrão. Quem
-  // consome pede `idioma` e não precisa saber que existe uma ordem.
-  //
-  // O cookie só é lido quando a resposta DEPENDE dele: quem já tem preferência
-  // própria, e quem não pertence a organização nenhuma, não têm o que resolver.
-  // Ler assim mesmo faria toda tela do produto tocar o cookie para descartar o
-  // valor em seguida.
-  const idioma = normalizarIdioma(
-    locale ?? support?.locale ?? (await localeDaOrgAtiva(memberships)),
-  );
-  const timezone = (user.user_metadata?.timezone as string | undefined) ?? null;
-
-  return {
-    id: user.id,
-    email: user.email ?? "",
-    full_name: fullName,
-    avatar_url: avatarUrl,
-    is_platform_admin: !!paRow,
-    platform_admin_scope: paRow?.scope ?? null,
-    locale,
-    idioma,
-    timezone,
-    organizations: memberships,
-    support,
-  };
+  return await resolverUsuario();
 });
 
 /**

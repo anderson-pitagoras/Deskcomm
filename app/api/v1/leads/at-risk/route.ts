@@ -20,6 +20,7 @@ import { requireRole } from "@/lib/auth/require-role";
 import { carregaRadarDeRisco, RADAR_MIN_HOURS_PADRAO } from "@/lib/leads/radar-de-risco";
 import { createClient } from "@/lib/supabase/server";
 import { traduzir } from "@/lib/i18n/dicionario";
+import { obterOuComputar } from "@/lib/cache/camada-cache";
 
 export const dynamic = "force-dynamic";
 
@@ -49,11 +50,14 @@ export async function GET(req: NextRequest): Promise<Response> {
   const { limit, min_hours } = parsed.data;
 
   try {
-    const radar = await carregaRadarDeRisco(await createClient(), {
-      organizationId: org.orgId,
-      humanRole: org.role,
-      limit,
-      minHours: min_hours,
+    const cacheKey = `radar:${org.orgId}:${org.role}:${limit}:${min_hours}`;
+    const radar = await obterOuComputar(cacheKey, 15, async () => {
+      return await carregaRadarDeRisco(await createClient(), {
+        organizationId: org.orgId,
+        humanRole: org.role,
+        limit,
+        minHours: min_hours,
+      });
     });
     return ok(radar, { requestId });
   } catch {
